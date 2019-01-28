@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# get the latest data / ruleset from git
+cd /capo-firewalls && git pull -q
+
+
+
+### update CAPO usw1
+team=capousw1
+index=19
+subnet="172.18.${index}.0/24"
+/gen_iptables_from_csv.sh /capo-firewalls/aws-${index}-${team}.list aws-${index}-${team} ${subnet}
+

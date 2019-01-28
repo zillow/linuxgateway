@@ -1,0 +1,2 @@
+#!/bin/bash
+if ! ps ax | grep -v grep | grep keepalived >/dev/null; then echo "keepalived NOT running - please fix" | mail -s "WATCHDOG: $HOSTNAME" root; fi

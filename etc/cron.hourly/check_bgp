@@ -1,0 +1,2 @@
+#!/bin/bash
+echo "show protocols" | birdc | grep BGP | grep -v Established | mail -Es BGP-report root

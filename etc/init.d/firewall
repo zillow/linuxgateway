@@ -1,0 +1,149 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          scriptname
+# Required-Start:    $network
+# Required-Stop:     $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: iptables
+# Description:       Enable firewall rules
+### END INIT INFO
+
+exec 1> >(logger -s -t $(basename $0)) 2>&1
+
+LANREAL='ens7f1.57'
+WANREAL='ens7f0'
+LANVRRP='pvt_+'
+WANVRRP='pub_+'
+VTI='vti+'
+SMTPHOSTS="10.0.0.1 10.1.2.3"
+
+case $1 in
+   start)
+	echo -n "firewall start..."
+
+     ### loading FTP helper module to allow active FTP connections
+        modprobe nf_conntrack_ftp
+        modprobe nf_nat_ftp
+	### may soon be needed (check dmesg) 
+        ### iptables -t raw -A FORWARD -p tcp --dport 21 -j CT --helper ftp
+     ### start of FORWARD chain
+	iptables -P FORWARD ACCEPT  # needed to not drop packets while I rebuild the ruleset, switching back to default DROP in just a few lines
+	iptables -F FORWARD
+       ## I'm a stateful firewall -> allow existing connections back in
+	iptables -A FORWARD -i $VTI        -o $LANREAL    -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A FORWARD -i $VTI        -o $VTI        -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A FORWARD -i $WANREAL    -o $LANREAL    -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A FORWARD -i $WANVRRP    -o $LANREAL    -m state --state ESTABLISHED,RELATED -j ACCEPT
+       ## Limit outbount SMTP to a predefined list
+        iptables -F SMTP-out || iptables -N SMTP-out
+        iptables -A FORWARD -i $LANVRRP   -o $WANREAL     -p tcp --dport 25   -j SMTP-out
+       ## Default Outbound Forward Policies below for trust to untrust -> do NOT change unless you know what you're doing
+        iptables -A FORWARD -i $LANVRRP    -o $WANREAL    -j ACCEPT
+        iptables -A FORWARD -i $LANREAL    -o $WANREAL    -j ACCEPT
+        iptables -A FORWARD -i $LANREAL    -o $VTI        -j ACCEPT
+        iptables -A FORWARD -p icmp -j ACCEPT
+	iptables -P FORWARD DROP    # default policy to DROP it all
+     ### End Default Forward
+
+
+     ### Allow SMTP outbound ruleset
+        for smtphost in $SMTPHOSTS
+	  do
+            iptables -A SMTP-out -i $LANVRRP  -o $WANREAL  -s $smtphost -p tcp --dport 25  -j ACCEPT
+        done
+       ## Default REJECT all
+        #iptables -A SMTP-out -i $LANVRRP   -o $WANREAL     -p tcp --dport 25   -j LOG
+        iptables -A SMTP-out -i $LANVRRP   -o $WANREAL     -p tcp --dport 25   -j REJECT
+     ### End SMTP outbound ruleset
+
+
+     ### Bot whitelisted IPs
+        iptables -N BOT-WHITELIST
+	iptables -A BOT-WHITELIST -s 4.53.108.110/32 -j ACCEPT
+     ### End Bot whitelisted IPs
+
+
+     ### VPN policies are generated dynamic and parent setup is in /vpns/*.ipsec.sh
+       ## when booting up make sure you run all *.ipsec.sh scripts (those also setup the VPN interfaces)
+       ## and the hourly cron job refresh-capo-firewall.sh AFTER the initial *ipsec.sh scripts
+
+
+     ### Start DNAT table -> BE SURE to also add the matching FORWARD rule to actually allow the traffic
+        iptables -t nat -F PREROUTING
+        iptables -A FORWARD -d 172.16.12.61 -p tcp --dport 25 -j ACCEPT
+        iptables -t nat -A PREROUTING -d 192.168.10.20 -p tcp --dport 25 -j DNAT --to 172.16.12.61:25
+     ### End DNAT table
+
+
+     ### Start SNAT table ... here we need all the OUTBOUND MIP rules
+        iptables -t nat -F POSTROUTING
+        iptables -t nat -A POSTROUTING -s 172.16.12.61 -o $WANREAL -j SNAT --to 192.168.10.241
+       ### default SNAT rules ... for normal outbound connection NAT
+	#iptables -t nat -A POSTROUTING -o $WAN -j MASQUERADE
+	iptables -t nat -A POSTROUTING -s 172.16.0.0/12 -o $WANREAL -j SNAT --to 192.168.10.2
+	iptables -t nat -A POSTROUTING -s 10.0.0.0/8    -o $WANREAL -j SNAT --to 192.168.10.2
+	#iptables -t nat -A POSTROUTING -s 10.0.0.0/8    -o $WANREAL -j SNAT --to 192.168.10.2 --to 192.168.10.3 --to 192.168.10.4  # in case more source IPs are needed for loadbalancing
+     ### End SNAT rules
+
+
+     ### start of INPUT chain
+	iptables -P INPUT ACCEPT
+	iptables -F INPUT
+       ### Default Input Policies below  -> do NOT change unless you know what you're doing
+	iptables -A INPUT -i ${LANVRRP} -j ACCEPT
+	iptables -A INPUT -i ${LANREAL} -j ACCEPT
+	iptables -A INPUT -d 224.0.0.0/24 -j ACCEPT
+	iptables -A INPUT -p icmp -j ACCEPT
+	iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A INPUT -i lo -j ACCEPT
+       ### Allow IPsec and BGP from our VPN/AWS Peers
+        iptables -A INPUT -p udp --dport  500 -j ACCEPT
+        iptables -A INPUT -p udp --dport 4500 -j ACCEPT
+        iptables -A INPUT -i $VTI -s 169.254.0.0/16 -p tcp --dport  179 -j ACCEPT
+       ### DROP the rest
+	iptables -P INPUT DROP
+     ### End Default Input
+
+
+     ### Start mangling table ... should only be needed for VPN subnets due to MTU issues over the tunnels
+        iptables -t mangle -F
+        iptables -t mangle -A FORWARD -p tcp -m tcp -s 172.16.0.0/16 --tcp-flags SYN,RST SYN -m tcpmss --mss 1388:1536 -j TCPMSS --set-mss 1387
+        iptables -t mangle -A FORWARD -p tcp -m tcp -d 172.16.0.0/16 --tcp-flags SYN,RST SYN -m tcpmss --mss 1388:1536 -j TCPMSS --set-mss 1387
+     ### End mangling tables
+
+
+     ### make it one of the big guys
+	sysctl -q net.ipv4.ip_forward=1
+        sysctl -q net.ipv4.tcp_limit_output_bytes=1048576
+	echo 1048576 > /sys/module/nf_conntrack/parameters/hashsize        ## increase max connections
+	echo 1048576 > /proc/sys/net/netfilter/nf_conntrack_max            ## increase max connections
+
+	echo " done"
+	;;
+   stop)
+	echo -n "firewall stop..."
+	sysctl net.ipv4.ip_forward=0
+        sysctl net.ipv4.tcp_limit_output_bytes=131072
+	echo 16384 > /sys/module/nf_conntrack/parameters/hashsize
+	echo 65536 > /proc/sys/net/netfilter/nf_conntrack_max
+
+	#### Firewall rules
+	iptables -P INPUT ACCEPT
+	iptables -P FORWARD ACCEPT
+	iptables -F
+	iptables -F -t nat
+	iptables -F -t mangle
+	iptables -X
+	iptables -X -t nat
+	iptables -X -t mangle
+	echo " done"
+	;;
+   restart)
+        #$0 stop
+        $0 start
+        ;;
+   *)
+	echo "use $0 [start|stop|restart]"
+	;;
+esac
